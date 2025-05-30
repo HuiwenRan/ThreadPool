@@ -1,48 +1,95 @@
 #include "threadpool.h"
 
 const int TASK_MAX_THRESHHOLD = 1024;
+const int THREAD_MAX_THRESHHOLD = 10;
+const int IdelTimeout = 2; // 空闲线程超时时间，单位秒
 
 ThreadPool::ThreadPool()
 	: taskSize_(0)
 	, taskQueMaxThreshHold_(TASK_MAX_THRESHHOLD)
-	, poolMode_(PoolMode::MODE_FIXED) 
+	, threadSizeThreshHold_(THREAD_MAX_THRESHHOLD)
+	, poolMode_(PoolMode::MODE_FIXED)
+	, isPoolrunning_(false)
+	, initThreadSize_(0)
+	, idleThreadSize_(0)
 {}
 
 ThreadPool::~ThreadPool(){}
 
 void ThreadPool::setMode(PoolMode mode) {
+	if (checkRunningState()) return;
 	poolMode_ = mode;
 }
+void ThreadPool::setThreadSizeThreshHold(int threshHold) {
+	if (checkRunningState()) return;
+	if (threshHold > 0 && poolMode_ == PoolMode::MODE_CACHED) {
+		threadSizeThreshHold_ = threshHold;
+	}
+	else {
+		std::cerr << "Invalid thread size threshold. Must be greater than 0." << std::endl;
+	}
+}
+void ThreadPool::setTaskQueMaxThreshHold(int taskQueMaxThreshHold) {
+	if (checkRunningState()) return;
+	if (taskQueMaxThreshHold > 0) {
+		taskQueMaxThreshHold_ = taskQueMaxThreshHold;
+	}
+	else {
+		std::cerr << "Invalid task queue max threshold. Must be greater than 0." << std::endl;
+	}
+}
+
 // 开启线程池
 void ThreadPool::start(int initThreadSize)
 {
+	isPoolrunning_ = true; // 设置线程池运行状态为true
+
 	if (initThreadSize > 0) {
 		initThreadSize_ = initThreadSize;
+
 	}
 	else {
 		std::cerr << "Invalid thread size. Must be greater than 0." << std::endl;
 	}
 	for (int i = 0; i < initThreadSize_; ++i) {
-		// 下面这是错误写法，unique_ptr不允许拷贝赋值，但是可以移动std::move(ptr)
-		/*auto ptr = std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc));
-		threads_.emplace_back(ptr);*/
-		// 下面写法虽然正确，但是直接使用new，如果在emplace_back出错，则会出现内存泄漏
-		//threads_.emplace_back(new Thread(std::bind(&ThreadPool::threadFunc, this)));
-		threads_.emplace_back(std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc, this)));
+		auto threadPtr = std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc, this, std::placeholders::_1));
+		threads_.insert(std::make_pair(threadPtr->getId(),std::move(threadPtr)));
 	}
 	for (auto& thread : threads_) {
-		thread->start();
+		thread.second->start();
+		idleThreadSize_++;
 	}
 }
 
-void ThreadPool::threadFunc() 
+void ThreadPool::threadFunc(int threadId) 
 {
 	// 注意这是在子线程中执行的函数，！！！！消费者
 	while (1) 
 	{
-		std::unique_lock<std::mutex> lock(taskQueMtx_);
 		std::cout << "tid" << std::this_thread::get_id() << " waiting for task." << std::endl;
-		notEmpty_.wait(lock, [this]()->bool {return !taskQue_.empty(); });
+
+		std::unique_lock<std::mutex> lock(taskQueMtx_);
+
+		if(poolMode_ == PoolMode::MODE_FIXED)
+			notEmpty_.wait(lock, [this]()->bool {return !taskQue_.empty(); });
+		else {
+			while (taskQue_.empty())
+			{
+				if (std::cv_status::timeout == notEmpty_.wait_for(lock, std::chrono::seconds(IdelTimeout)))
+				{
+					// 超时返回，线程数量大于初始值，则退出当前线程
+					if (threads_.size() > initThreadSize_)
+					{
+						std::cout << "tid" << std::this_thread::get_id() << " exiting due to idle timeout." << std::endl;
+						idleThreadSize_--; // 确保空闲线程计数正确
+						threads_.erase(threadId); // 从线程池中移除当前线程
+						return; // 退出当前线程
+					}
+				}
+			}
+		}
+	
+		idleThreadSize_--;
 		std::cout << "tid" << std::this_thread::get_id() << " got a task." << std::endl;
 		std::shared_ptr<Task> task = taskQue_.front();
 		taskQue_.pop();
@@ -67,6 +114,9 @@ void ThreadPool::threadFunc()
 		catch (...) {
 			std::cerr << "Unknown task exception." << std::endl;
 		}
+		// 任务执行完毕，线程可以继续等待下一个任务
+		std::cout << "tid" << std::this_thread::get_id() << " finished a task." << std::endl;
+		idleThreadSize_++;
 	}
 }
 
@@ -87,6 +137,21 @@ Result ThreadPool::submitTask(std::shared_ptr<Task> task)
 	taskSize_++;
 
 	notEmpty_.notify_all();
+
+	if (poolMode_ == PoolMode::MODE_CACHED
+		&& taskSize_ > idleThreadSize_
+		&& threads_.size() < threadSizeThreshHold_)
+	{
+		std::cout << "Creating new thread to handle task." << std::endl;
+		// 如果是缓存模式，并且任务队列中的任务数量大于空闲线程数量，并且线程数量小于阈值
+		// 则创建新的线程来处理任务
+		auto threadPtr = std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc, this,std::placeholders::_1));
+		int threadId = threadPtr->getId();
+		threads_.insert(std::make_pair(threadId, std::move(threadPtr)));
+		threads_[threadId]->start();
+		idleThreadSize_++;
+	}
+
 	// 将Result传递给Task！！！
 	// 这里要将对象Result直接返回给用户，同时还要将Result对象与Task关联起来，难点
 	return Result(task);
@@ -96,6 +161,7 @@ Result ThreadPool::submitTask(std::shared_ptr<Task> task)
 
 Thread::Thread(ThreadFunc func)
 	: func_(func)
+	, threadId_(generateNum++) // 生成唯一的线程ID
 { }
 
 Thread::~Thread(){}
@@ -103,7 +169,7 @@ Thread::~Thread(){}
 void Thread::start()
 {
 	// 创建线程来执行func_
-	std::thread t(func_);
+	std::thread t(func_, threadId_);
 	t.detach(); 
 }
 

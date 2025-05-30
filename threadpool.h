@@ -2,6 +2,7 @@
 #define THREADPOOL_H
 #include <iostream>
 #include <vector>
+#include <unordered_map>
 #include <queue>
 #include <memory>
 #include <mutex>
@@ -93,7 +94,10 @@ public:
 	~Result() = default;
 	void setVal(Any any);
 	Any get();
-
+	Result(Result&&) = default;
+	Result& operator=(Result&&) = default;
+	Result(const Result&) = delete;
+	Result& operator=(const Result&) = delete;
 private:
 	Any data_; // 存储任务的返回值
 	Semaphore sem_; // 线程通信信号量
@@ -121,12 +125,15 @@ enum class PoolMode {
 
 class Thread {
 public:
-	using ThreadFunc = std::function<void()>;
+	using ThreadFunc = std::function<void(int)>;
 	Thread(ThreadFunc);
 	~Thread();
 	void start();
+	inline static int generateNum = 0; //用来辅助生成线程ID
+	int getId() const { return threadId_; }
 private:
 	ThreadFunc func_;
+	int threadId_;
 };
 
 class ThreadPool{
@@ -134,8 +141,10 @@ public:
 	ThreadPool();
 	~ThreadPool();
 	void start(int initThreadSize = 4);
-	void setMode(PoolMode mode);
 
+	void setMode(PoolMode mode);
+	void setThreadSizeThreshHold(int threshHold);
+	void setTaskQueMaxThreshHold(int threshHold);
 	Result submitTask(std::shared_ptr<Task> task); //生产任务
 
 	ThreadPool(const ThreadPool& threadPool) = delete;
@@ -143,9 +152,16 @@ public:
 
 private:
 	// vector在出作用域后会自动调用元素的析构函数，释放内存
-	std::vector<std::unique_ptr<Thread>> threads_;
+	std::unordered_map<int, std::unique_ptr<Thread>> threads_;
 	int initThreadSize_;
-	void threadFunc(); //线程池指定线程执行的函数！！！消费任务
+	std::atomic<int> idleThreadSize_;
+	int threadSizeThreshHold_;
+
+	void threadFunc(int); //线程池指定线程执行的函数！！！消费任务
+
+	bool checkRunningState() const {
+		return isPoolrunning_;
+	}
 
 	std::queue<std::shared_ptr<Task>> taskQue_;
 	std::atomic_int taskSize_;
@@ -156,6 +172,7 @@ private:
 	std::condition_variable notEmpty_;
 
 	PoolMode poolMode_;
+	std::atomic<bool> isPoolrunning_;
 };
 
 #endif // THREADPOOL_H
