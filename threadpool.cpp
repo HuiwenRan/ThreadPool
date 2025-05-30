@@ -13,11 +13,6 @@ ThreadPool::~ThreadPool(){}
 void ThreadPool::setMode(PoolMode mode) {
 	poolMode_ = mode;
 }
-
-void ThreadPool::setInitThreadSize(int size) {
-	
-}
-
 // 开启线程池
 void ThreadPool::start(int initThreadSize)
 {
@@ -46,9 +41,9 @@ void ThreadPool::threadFunc()
 	while (1) 
 	{
 		std::unique_lock<std::mutex> lock(taskQueMtx_);
-
+		std::cout << "tid" << std::this_thread::get_id() << " waiting for task." << std::endl;
 		notEmpty_.wait(lock, [this]()->bool {return !taskQue_.empty(); });
-
+		std::cout << "tid" << std::this_thread::get_id() << " got a task." << std::endl;
 		std::shared_ptr<Task> task = taskQue_.front();
 		taskQue_.pop();
 		taskSize_--;
@@ -63,7 +58,8 @@ void ThreadPool::threadFunc()
 		lock.unlock();
 
 		try {
-			task->run();
+			// 执行任务，把任务返回值setVal给Result对象
+			task->exec();
 		}
 		catch (const std::exception& e) {
 			std::cerr << "Task exception: " << e.what() << std::endl;
@@ -75,7 +71,7 @@ void ThreadPool::threadFunc()
 }
 
 
-void ThreadPool::submitTask(std::shared_ptr<Task> task)
+Result ThreadPool::submitTask(std::shared_ptr<Task> task)
 {
 	std::unique_lock<std::mutex> lock(taskQueMtx_);
 
@@ -84,16 +80,19 @@ void ThreadPool::submitTask(std::shared_ptr<Task> task)
 		[this]()->bool {return taskSize_ < taskQueMaxThreshHold_; }))
 	{
 		std::cerr << "Task queue is full, cannot submit task." << std::endl;
-		return;
+		return Result(task, false);
 	}
 
 	taskQue_.emplace(task);
 	taskSize_++;
 
 	notEmpty_.notify_all();
+	// 将Result传递给Task！！！
+	// 这里要将对象Result直接返回给用户，同时还要将Result对象与Task关联起来，难点
+	return Result(task);
 }
 
-// 以下是Thread类的实现
+/////////// 以下是Thread类的实现
 
 Thread::Thread(ThreadFunc func)
 	: func_(func)
@@ -106,4 +105,46 @@ void Thread::start()
 	// 创建线程来执行func_
 	std::thread t(func_);
 	t.detach(); 
+}
+
+//////////// 以下是Task类的实现
+Task::Task() 
+	:result_(nullptr)
+{}
+
+void Task::exec()
+{
+	// 执行任务的run方法，多态
+	if(result_ != nullptr)
+		result_->setVal(run());
+}
+
+void Task::setResult(Result* res)
+{
+	result_ = res;
+}
+
+//////////// 以下是Result类的实现
+Result::Result(std::shared_ptr<Task> task, bool isValid)
+	: task_(task),
+	isValid_(isValid)
+{
+	task_->setResult(this); // 设置任务的结果指针为当前Result对象
+}
+
+Any Result::get()
+{
+	// 用户调用，获取任务返回值，但是可能没有执行完，需要等待
+	if (!isValid_) {
+		return "";
+	}
+	sem_.wait();  //如果还没有计算完，就先阻塞等待
+	return std::move(data_);
+}
+
+void Result::setVal(Any data)
+{
+	//  存储task的返回值，在任务执行完后主动调用
+	data_ = std::move(data);
+	sem_.post(); // 通知等待的线程，数据已经准备好了
 }
