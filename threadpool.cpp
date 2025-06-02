@@ -14,7 +14,15 @@ ThreadPool::ThreadPool()
 	, idleThreadSize_(0)
 {}
 
-ThreadPool::~ThreadPool(){}
+ThreadPool::~ThreadPool()
+{
+	std::unique_lock<std::mutex> lock(taskQueMtx_);
+	// 关闭线程池，设置运行状态为false
+	isPoolrunning_ = false;
+	// 通知所有线程退出
+	notEmpty_.notify_all();
+	exitCond_.wait(lock, [this]() { return threads_.empty(); });
+}
 
 void ThreadPool::setMode(PoolMode mode) {
 	if (checkRunningState()) return;
@@ -70,11 +78,18 @@ void ThreadPool::threadFunc(int threadId)
 
 		std::unique_lock<std::mutex> lock(taskQueMtx_);
 
-		if(poolMode_ == PoolMode::MODE_FIXED)
-			notEmpty_.wait(lock, [this]()->bool {return !taskQue_.empty(); });
-		else {
-			while (taskQue_.empty())
-			{
+		
+		while (taskQue_.empty())
+		{
+			if (isPoolrunning_ == false) {
+				std::cout << "tid" << std::this_thread::get_id() << " exiting due to pool shutdown." << std::endl;
+				threads_.erase(threadId);
+				exitCond_.notify_one();
+				return; // 线程池关闭，退出当前线程
+			}
+			if (poolMode_ == PoolMode::MODE_FIXED)
+				notEmpty_.wait(lock);
+			else {
 				if (std::cv_status::timeout == notEmpty_.wait_for(lock, std::chrono::seconds(IdelTimeout)))
 				{
 					// 超时返回，线程数量大于初始值，则退出当前线程
@@ -196,6 +211,10 @@ Result::Result(std::shared_ptr<Task> task, bool isValid)
 	isValid_(isValid)
 {
 	task_->setResult(this); // 设置任务的结果指针为当前Result对象
+}
+Result::~Result() {
+	// Result是栈上对象，很可能被提前析构，而任务后面才执行完，此时就会出现悬空指针问题
+	task_->setResult(nullptr);// 清除任务的结果指针，避免悬空指针!!!
 }
 
 Any Result::get()

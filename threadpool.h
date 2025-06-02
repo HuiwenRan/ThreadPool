@@ -91,7 +91,7 @@ class Result {
 // ЖСепаДеп
 public:
 	Result(std::shared_ptr<Task> task, bool isValid = true);
-	~Result() = default;
+	~Result();
 	void setVal(Any any);
 	Any get();
 	Result(Result&&) = default;
@@ -170,6 +170,7 @@ private:
 	std::mutex taskQueMtx_;
 	std::condition_variable notFull_;
 	std::condition_variable notEmpty_;
+	std::condition_variable exitCond_;
 
 	PoolMode poolMode_;
 	std::atomic<bool> isPoolrunning_;
