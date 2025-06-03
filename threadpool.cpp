@@ -1,8 +1,6 @@
 #include "threadpool.h"
 
-const int TASK_MAX_THRESHHOLD = 1024;
-const int THREAD_MAX_THRESHHOLD = 10;
-const int IdelTimeout = 2; // 空闲线程超时时间，单位秒
+
 
 ThreadPool::ThreadPool()
 	: taskSize_(0)
@@ -106,7 +104,7 @@ void ThreadPool::threadFunc(int threadId)
 	
 		idleThreadSize_--;
 		std::cout << "tid" << std::this_thread::get_id() << " got a task." << std::endl;
-		std::shared_ptr<Task> task = taskQue_.front();
+		Task task = taskQue_.front();
 		taskQue_.pop();
 		taskSize_--;
 		notFull_.notify_one();
@@ -121,7 +119,7 @@ void ThreadPool::threadFunc(int threadId)
 
 		try {
 			// 执行任务，把任务返回值setVal给Result对象
-			task->exec();
+			task();
 		}
 		catch (const std::exception& e) {
 			std::cerr << "Task exception: " << e.what() << std::endl;
@@ -133,43 +131,6 @@ void ThreadPool::threadFunc(int threadId)
 		std::cout << "tid" << std::this_thread::get_id() << " finished a task." << std::endl;
 		idleThreadSize_++;
 	}
-}
-
-
-Result ThreadPool::submitTask(std::shared_ptr<Task> task)
-{
-	std::unique_lock<std::mutex> lock(taskQueMtx_);
-
-	if (!notFull_.wait_for(lock,
-		std::chrono::seconds(1),
-		[this]()->bool {return taskSize_ < taskQueMaxThreshHold_; }))
-	{
-		std::cerr << "Task queue is full, cannot submit task." << std::endl;
-		return Result(task, false);
-	}
-
-	taskQue_.emplace(task);
-	taskSize_++;
-
-	notEmpty_.notify_all();
-
-	if (poolMode_ == PoolMode::MODE_CACHED
-		&& taskSize_ > idleThreadSize_
-		&& threads_.size() < threadSizeThreshHold_)
-	{
-		std::cout << "Creating new thread to handle task." << std::endl;
-		// 如果是缓存模式，并且任务队列中的任务数量大于空闲线程数量，并且线程数量小于阈值
-		// 则创建新的线程来处理任务
-		auto threadPtr = std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc, this,std::placeholders::_1));
-		int threadId = threadPtr->getId();
-		threads_.insert(std::make_pair(threadId, std::move(threadPtr)));
-		threads_[threadId]->start();
-		idleThreadSize_++;
-	}
-
-	// 将Result传递给Task！！！
-	// 这里要将对象Result直接返回给用户，同时还要将Result对象与Task关联起来，难点
-	return Result(task);
 }
 
 /////////// 以下是Thread类的实现
@@ -186,50 +147,4 @@ void Thread::start()
 	// 创建线程来执行func_
 	std::thread t(func_, threadId_);
 	t.detach(); 
-}
-
-//////////// 以下是Task类的实现
-Task::Task() 
-	:result_(nullptr)
-{}
-
-void Task::exec()
-{
-	// 执行任务的run方法，多态
-	if(result_ != nullptr)
-		result_->setVal(run());
-}
-
-void Task::setResult(Result* res)
-{
-	result_ = res;
-}
-
-//////////// 以下是Result类的实现
-Result::Result(std::shared_ptr<Task> task, bool isValid)
-	: task_(task),
-	isValid_(isValid)
-{
-	task_->setResult(this); // 设置任务的结果指针为当前Result对象
-}
-Result::~Result() {
-	// Result是栈上对象，很可能被提前析构，而任务后面才执行完，此时就会出现悬空指针问题
-	task_->setResult(nullptr);// 清除任务的结果指针，避免悬空指针!!!
-}
-
-Any Result::get()
-{
-	// 用户调用，获取任务返回值，但是可能没有执行完，需要等待
-	if (!isValid_) {
-		return "";
-	}
-	sem_.wait();  //如果还没有计算完，就先阻塞等待
-	return std::move(data_);
-}
-
-void Result::setVal(Any data)
-{
-	//  存储task的返回值，在任务执行完后主动调用
-	data_ = std::move(data);
-	sem_.post(); // 通知等待的线程，数据已经准备好了
 }

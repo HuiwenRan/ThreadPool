@@ -9,114 +9,12 @@
 #include <condition_variable>
 #include <functional>
 #include <thread>
+#include <atomic>
+#include <future>
 
-/*
-Any 类型
-可以接受任意类型的对象
-且Any不是模板类
-*/
-class Any {
-public:
-	Any() = default;
-	~Any() = default;
-	Any(const Any&) = delete;
-	Any& operator=(const Any&) = delete;
-	Any(Any&&) = default;
-	Any& operator=(Any&&) = default;
-	// 1. 首先要能接受任意类型的实例  ===》 函数模板
-	template<typename T>
-	Any(T data):base_(std::make_unique<Derive<T>>(data)){}
-
-	// 3. 要能提取任意类型的实例 ==> 智能指针get()+类型转换dynamic_cast<>()
-	template<typename T>
-	T cast() const {
-		Derive<T>* derive = dynamic_cast<Derive<T>*>(base_.get());// 智能指针使用get()获得裸指针
-		if (derive == nullptr) {
-			throw "Bad cast: type mismatch in Any::cast()";
-		}
-		return derive->get();
-	}
-private:
-	// 2. 要能存储任意类型的实例 ==> 类模板 + 多态
-	// 此处如果只用一个类模板，则无法将其转为成员变量，也就无法存储在Any类中
-	class Base {
-	public:
-		virtual ~Base() = default;// 继承时需要虚析构函数
-	private:
-	};
-	template<typename T>
-	class Derive : public Base {
-	public:
-		Derive(T t) : data_(t) {}
-		~Derive() = default;
-		T& get(){ return data_; }
-	private:
-		T data_;
-	};
-	std::unique_ptr<Base> base_;
-};
-
-class Semaphore
-{
-public:
-	Semaphore(int limit = 0) :resLimit_(limit) {}
-	~Semaphore() = default;
-
-	void wait() {
-		// 获取一个信号量资源
-		std::unique_lock<std::mutex> lock(mtx_);
-		// 阻塞在条件变量上的线程被唤醒
-		// 1. 重新获取锁，如果没有获取到锁，则继续等待
-		// 2. 条件变量被唤醒后，检查条件是否满足，如果不满足，则继续等待
-		// 3. 条件满足后，开始执行临界区代码
-		cond_.wait(lock, [this]()->bool {return resLimit_ > 0; });// 此处是安全的
-		resLimit_--;
-	}
-
-	void post() {
-		// 增加一个信号量资源
-		std::unique_lock<std::mutex> lock(mtx_);
-		resLimit_++;
-		cond_.notify_all();
-	}
-private:
-	int resLimit_;
-	std::mutex mtx_;
-	std::condition_variable cond_;
-};
-
-class Task;//前置声明
-
-class Result {
-// 读者写者
-public:
-	Result(std::shared_ptr<Task> task, bool isValid = true);
-	~Result();
-	void setVal(Any any);
-	Any get();
-	Result(Result&&) = default;
-	Result& operator=(Result&&) = default;
-	Result(const Result&) = delete;
-	Result& operator=(const Result&) = delete;
-private:
-	Any data_; // 存储任务的返回值
-	Semaphore sem_; // 线程通信信号量
-	// 任务指针，用于将该Result传递给Task对象，使得子线程能访问并将结果记录
-	std::shared_ptr<Task> task_; // 一般任务指针比结果指针生命周期短，所以需要使用共享指针来延长Task对象周期
-	std::atomic_bool isValid_;// 返回值是否有效
-
-};
-
-// 任务抽象类，所有任务都继承此
-class Task {
-public:
-	Task();
-	virtual Any run() = 0;
-	void setResult(Result* res);
-	void exec();
-private:
-	Result* result_; // 不能仅仅存储Result对象
-};
+const int TASK_MAX_THRESHHOLD = 1024;
+const int THREAD_MAX_THRESHHOLD = 10;
+const int IdelTimeout = 2; // 空闲线程超时时间，单位秒
 
 enum class PoolMode {
 	MODE_FIXED,
@@ -145,7 +43,57 @@ public:
 	void setMode(PoolMode mode);
 	void setThreadSizeThreshHold(int threshHold);
 	void setTaskQueMaxThreshHold(int threshHold);
-	Result submitTask(std::shared_ptr<Task> task); //生产任务
+
+	// 使用可变参模板编程，让submitTask可以接受任意函数和任意数量的参数
+	template<typename Func, typename... Args>
+	auto submitTask(Func&& func, Args&&... args) -> std::future<decltype(func(args...))>
+	{
+		// 先使用std::packaged_task将函数和参数打包成一个任务
+		// 这样可以直接获得任务的返回
+		using ReturnType = decltype(func(args...));
+		auto task = std::make_shared<std::packaged_task<ReturnType()>>(
+			std::bind(std::forward<Func>(func), std::forward<Args>(args)...)
+		);
+
+		std::unique_lock<std::mutex> lock(taskQueMtx_);
+
+		if (!notFull_.wait_for(lock,
+			std::chrono::seconds(1),
+			[this]()->bool {return taskSize_ < taskQueMaxThreshHold_; }))
+		{
+			std::cerr << "Task queue is full, cannot submit task." << std::endl;
+			auto task = std::make_shared<std::packaged_task<ReturnType()>>(
+				[]()->ReturnType {
+					return ReturnType();
+				});
+			(*task)();
+			return task->get_future();
+		}
+		// 增加中间件，使得任务统一为void()对象
+		taskQue_.emplace([task](){(*task)(); });
+
+		taskSize_++;
+
+		notEmpty_.notify_all();
+
+		if (poolMode_ == PoolMode::MODE_CACHED
+			&& taskSize_ > idleThreadSize_
+			&& threads_.size() < threadSizeThreshHold_)
+		{
+			std::cout << "Creating new thread to handle task." << std::endl;
+			// 如果是缓存模式，并且任务队列中的任务数量大于空闲线程数量，并且线程数量小于阈值
+			// 则创建新的线程来处理任务
+			auto threadPtr = std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc, this, std::placeholders::_1));
+			int threadId = threadPtr->getId();
+			threads_.insert(std::make_pair(threadId, std::move(threadPtr)));
+			threads_[threadId]->start();
+			idleThreadSize_++;
+		}
+
+		// 将Result传递给Task！！！
+		// 这里要将对象Result直接返回给用户，同时还要将Result对象与Task关联起来，难点
+		return task->get_future();
+	}
 
 	ThreadPool(const ThreadPool& threadPool) = delete;
 	ThreadPool& operator=(const ThreadPool& threadPool) = delete;
@@ -163,7 +111,10 @@ private:
 		return isPoolrunning_;
 	}
 
-	std::queue<std::shared_ptr<Task>> taskQue_;
+
+	// Task 任务==》函数对象
+	using Task = std::function<void()>;
+	std::queue<Task> taskQue_;
 	std::atomic_int taskSize_;
 	int taskQueMaxThreshHold_;
 
